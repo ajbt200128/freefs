@@ -9,7 +9,7 @@ pub struct INode {
     pub mtime: SystemTime,
     pub kind: FileType,
     pub parent: u64,
-    data_hash:Vec<u8>,
+    pub hash:blake3::Hash,
 }
 
 impl INode {
@@ -20,6 +20,7 @@ impl INode {
         mtime: SystemTime,
         kind: FileType,
         parent: u64,
+        hash: blake3::Hash,
     ) -> Self {
         INode {
             key: key.to_string(),
@@ -28,7 +29,7 @@ impl INode {
             mtime,
             kind,
             parent,
-            data_hash:vec![],
+            hash,
         }
     }
 

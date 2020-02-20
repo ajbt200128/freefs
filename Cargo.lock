@@ -74,10 +74,12 @@ name = "bbfs"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "blake2",
+ "blake3",
+ "cdc",
  "chrono",
  "fuse",
  "futures",
+ "hex",
  "libc",
  "rust-s3",
  "tokio",
@@ -91,18 +93,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
 
 [[package]]
-name = "blake2"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94cb07b0da6a73955f8fb85d24c466778e70cda767a568229b104f0264089330"
-dependencies = [
- "byte-tools",
- "crypto-mac",
- "digest",
- "opaque-debug",
-]
-
-[[package]]
 name = "blake2b_simd"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -111,6 +101,21 @@ dependencies = [
  "arrayref",
  "arrayvec",
  "constant_time_eq",
+]
+
+[[package]]
+name = "blake3"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68df31bdf2bbb567e5adf8f21ac125dc0e897b1381e7b841f181521f06fc3134"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "crypto-mac",
+ "digest",
 ]
 
 [[package]]
@@ -163,6 +168,12 @@ name = "cc"
 version = "1.0.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d87b23d6a92cd03af510a5ade527033f6aa6fa92161e2d5863a907d4c5e31d"
+
+[[package]]
+name = "cdc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "433ab3df97754a3dd4bce346ab58780e956c630f26d6b586290703899625ad54"
 
 [[package]]
 name = "cfg-if"

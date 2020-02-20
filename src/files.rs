@@ -7,11 +7,15 @@ use fuse::{
     FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
+use futures::executor::block_on;
 use libc::{ENOENT, ENOTEMPTY};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, thread, mem};
-use futures::executor::block_on;
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub struct Files {
     data_source: Arc<BucketSource>,
@@ -21,7 +25,7 @@ pub struct Files {
 impl Files {
     pub fn new(data_source: BucketSource) -> Self {
         let mut new = Files {
-            data_source:Arc::new(data_source),
+            data_source: Arc::new(data_source),
             inode_tree: INodeTree::new(),
         };
         new.inode_tree.add(INode::new(
@@ -31,40 +35,44 @@ impl Files {
             UNIX_EPOCH,
             FileType::Directory,
             0,
+            blake3::hash(b""),
         ));
-        new.inode_tree
-            .add_from_keys(new.data_source.get_keys("").unwrap(), None);
-        let mut nodes = new.inode_tree.nodes.clone();
-        for node in &mut nodes{
-            if node.kind != FileType::Directory{
-                let path = new.inode_tree.get_full_path(node.ino).unwrap();
-                let (size,mtime) = new.data_source.get_data_attr(&path).unwrap_or((0,UNIX_EPOCH));
-               node.size = size;
-               node.mtime = mtime;
+        new.load_from_inode_tree_log();
+        for mut node in &mut new.inode_tree.nodes {
+            if node.kind != FileType::Directory {
+                let (size, mtime) = new
+                    .data_source
+                    .get_data_attr(&node.hash)
+                    .unwrap_or((0, UNIX_EPOCH));
+                node.size = size;
+                node.mtime = mtime;
             }
         }
-        new.inode_tree.nodes = nodes;
         new
     }
 
-    fn sync_path(&self, ino:u64){
-        let path = match self.inode_tree.get_full_path(ino) {
-            Ok(path) => path,
-            Err(e) => {
-                println!("flush ERROR: {}",e);
-                return
-            }
-        };
+    fn write_inode_tree(&self) {
+        let log = self.inode_tree.write_all_to_string();
+        self.data_source.put_log(log);
+    }
+
+    fn load_from_inode_tree_log(&mut self) {
+        let nodes = self.data_source.get_log();
+        self.inode_tree.add_from_keys(nodes, None);
+    }
+
+    fn sync_path(&self) {
         let data_source = Arc::clone(&self.data_source);
-        thread::spawn(move||{
-            match block_on(data_source.sync_stage_area(&path)) {
+        let hashes = self.inode_tree.get_hash_list();
+        thread::spawn(move || {
+            match block_on(data_source.sync_stage_area(hashes)) {
                 Err(e) => {
-                    println!("Sync ERROR: {}",e);
-                },
-                _ => {},
+                    println!("Sync ERROR: {}", e);
+                }
+                _ => {}
             };
-        }
-        );
+        });
+        self.write_inode_tree();
     }
 }
 
@@ -78,7 +86,8 @@ impl Filesystem for Files {
         reply: ReplyEmpty,
     ) {
         println!("flush {}", ino);
-        self.sync_path(ino);
+        self.sync_path();
+        println!("{}", self.inode_tree.write_all_to_string());
         reply.ok();
     }
 
@@ -158,15 +167,15 @@ impl Filesystem for Files {
     ) {
         let end = (offset + size as i64) as usize;
         println!("read {:?} {:?}, {}", ino, offset, size);
-        let path = match self.inode_tree.get_full_path(ino) {
-            Ok(path) => path,
+        let hash = match self.inode_tree.get_inode_from_ino(ino) {
+            Ok(entry) => entry.hash,
             Err(e) => {
-                println!("read ERROR: {}", e);
+                println!("setattr ERROR");
                 reply.error(ENOENT);
                 return;
             }
         };
-        let mut blocks = match self.data_source.get_data(&path) {
+        let mut blocks = match self.data_source.get_data(&hash) {
             Ok(result) => result,
             Err(e) => {
                 println!("read ERROR: {}", e);
@@ -231,29 +240,42 @@ impl Filesystem for Files {
         reply: ReplyWrite,
     ) {
         println!("Write: {:?}, {:?}, {:?} bytes", ino, offset, data.len());
-        let offset = offset as usize;
-        let path = match self.inode_tree.get_full_path(ino) {
-            Ok(path) => path,
-            Err(e) => {
-                println!("write ERROR: {}", e);
-                reply.error(ENOENT);
-                return;
+        let mut hash = blake3::hash(b"");
+        {
+            let offset = offset as usize;
+            let inode = match self.inode_tree.get_inode_from_ino(ino) {
+                Ok(inode) => inode,
+                Err(e) => {
+                    println!("write ERROR: {}", e);
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+            let mut blocks = match self.data_source.get_data(&inode.hash) {
+                Ok(result) => result,
+                Err(e) => {
+                    println!("write ERROR:{}", e);
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+            let buffer = data.len() + offset;
+            if buffer > 0 {
+                blocks.resize(buffer, 0);
             }
-        };
-        let mut blocks = match self.data_source.get_data(&path) {
-            Ok(result) => result,
-            Err(e) => {
-                println!("write ERROR:{}", e);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        let buffer = data.len() + offset;
-        if buffer > 0 {
-            blocks.resize(buffer, 0);
+            blocks.splice(offset..(data.len() + offset), data.to_vec());
+            hash = self.data_source.put_data(blocks);
+            match self.inode_tree.update_inode_hash(ino, hash.clone()) {
+                Err(e) => println!("write ERROR:{}", e),
+                _ => {}
+            };
         }
-        blocks.splice(offset..(data.len() + offset), data.to_vec());
-        self.data_source.put_data(&path, blocks);
+        if let Ok((size, mtime)) = self.data_source.get_data_attr(&hash) {
+            match self.inode_tree.update_inode_attr(ino, mtime, size) {
+                Err(e) => println!("write ERROR:{}", e),
+                _ => {}
+            };
+        }
         reply.written(data.len() as u32);
     }
 
@@ -278,14 +300,16 @@ impl Filesystem for Files {
             }
         };
 
-        let file_ino = self.inode_tree.add_empty(
-            name.to_string(),
-            parent,
-        );
-        let full_path = self.inode_tree.get_full_path(file_ino).unwrap();
-        self.data_source.put_data(&full_path, vec![]);
+        let ino = self
+            .inode_tree
+            .add_empty(name.to_string(), blake3::hash(b""), parent);
+        let hash = self.data_source.put_data(vec![]);
+        match self.inode_tree.update_inode_hash(ino, hash) {
+            Err(e) => println!("create ERROR:{}", e),
+            _ => {}
+        };
 
-        let attr = match self.inode_tree.get_inode_from_ino(file_ino) {
+        let attr = match self.inode_tree.get_inode_from_ino(ino) {
             Ok(entry) => entry.get_file_attr(),
             Err(e) => {
                 println!("create ERROR:{}", e);
@@ -299,97 +323,220 @@ impl Filesystem for Files {
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         println!("Unlink {:?}, {:?}", name, parent);
-        let entry = match self
-            .inode_tree
-            .get_inode_from_key_parent(name.to_str().unwrap(), parent)
+        let mut ino: Option<u64> = None;
         {
-            Ok(entry) => entry,
-            Err(e) => {
-                println!("unlink ERROR:{}", e);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        let full_path = match self.inode_tree.get_full_path(entry.ino) {
-            Ok(path) => path,
-            Err(e) => {
-                println!("unlink ERROR:{}", e);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        match block_on(self.data_source.delete_data(&full_path)) {
-            Err(e) => {
-                println!("unlink ERROR: {}",e);
-            },
-            _ => {}
-        };
-        
+            let entry = match self
+                .inode_tree
+                .get_inode_from_key_parent(name.to_str().unwrap(), parent)
+            {
+                Ok(entry) => entry,
+                Err(e) => {
+                    println!("unlink ERROR:{}", e);
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+            match block_on(self.data_source.delete_data(&entry.hash)) {
+                Err(e) => {
+                    println!("unlink ERROR: {}", e);
+                }
+                _ => {}
+            };
+            ino = Some(entry.ino);
+        }
+        match ino {
+            Some(ino) => self.inode_tree.remove(ino),
+            None => {}
+        }
+
         reply.ok();
     }
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
         let name = name.to_str().unwrap();
         println!("mkdir {}, {}", parent, name);
-       /* let parent_node = match self.inode_tree.get_inode_from_ino(parent) {
-            Ok(entry) => entry,
-            Err(e) => {
-                println!("mkdir ERROR: {}", e);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let dir_ino = self.inode_tree.add_inode_dir(
-            name,
-            Some(parent)
-        );
-        let path = self.inode_tree.get_full_path(dir_ino).unwrap();
-        let (res, code) =
-            match self
-                .bucket
-                .put_object_blocking(path + "/.bzEmpty", &[], "text/plain")
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    println!("mkdir ERROR: {}", e);
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
+        let dir_ino = self.inode_tree.add_inode_dir(name, Some(parent));
         let attr = self
             .inode_tree
             .get_inode_from_ino(dir_ino)
             .unwrap()
             .get_file_attr();
-        reply.entry(&Duration::from_secs(1), &attr, 0)*/
+        reply.entry(&Duration::from_secs(1), &attr, 0);
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_str().unwrap();
         println!("rmdir {}, {}", parent, name);
-        /*let dir = match self.inode_tree.get_inode_from_key_parent(name, parent) {
-            Ok(entry) => entry,
+        let dir = match self.inode_tree.get_inode_from_key_parent(name, parent) {
+            Ok(entry) => entry.ino,
             Err(e) => {
                 println!("rmdir ERROR: {}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        let children_count = self.inode_tree.get_children(dir.ino).iter().count();
-        let full_path = self.inode_tree.get_full_path(dir.ino).unwrap();
+        let children_count = self.inode_tree.get_children(dir).iter().count();
         if children_count > 0 {
             reply.error(ENOTEMPTY);
         } else {
-            let (result, code) = match self.bucket.delete_object_blocking(full_path + "/.bzEmpty") {
-                Ok(result) => result,
-                Err(e) => {
-                    println!("rmdir ERROR: {}", e);
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
-            assert_eq!(204, code);
-            reply.ok();
-        }*/
+            self.inode_tree.remove(dir);
+        }
+    }
+    fn init(&mut self, _req: &Request<'_>) -> Result<(), libc::c_int> {
+        Ok(())
+    }
+    fn destroy(&mut self, _req: &Request<'_>) {}
+    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
+    fn readlink(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyData) {
+        reply.error(libc::ENOSYS);
+    }
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _link: &Path,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _newparent: u64,
+        _newname: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _newparent: u64,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: ReplyOpen) {
+        reply.opened(0, 0);
+    }
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuse::ReplyStatfs) {
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+    }
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuse::ReplyXattr,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: fuse::ReplyXattr) {
+        reply.error(libc::ENOSYS);
+    }
+    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(libc::ENOSYS);
+    }
+    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: u32, reply: ReplyEmpty) {
+        reply.error(libc::ENOSYS);
+    }
+    fn getlk(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: u32,
+        _pid: u32,
+        reply: fuse::ReplyLock,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn setlk(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: u32,
+        _pid: u32,
+        _sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+    fn bmap(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _blocksize: u32,
+        _idx: u64,
+        reply: fuse::ReplyBmap,
+    ) {
+        reply.error(libc::ENOSYS);
     }
 }

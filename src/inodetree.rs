@@ -1,6 +1,10 @@
 use crate::inode::INode;
 use fuse::FileType;
-use std::{error::Error, fmt, time::UNIX_EPOCH};
+use std::{
+    error::Error,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Debug)]
 pub struct INodeTreeError {
@@ -39,11 +43,17 @@ impl INodeTree {
         }
     }
 
+    pub fn remove(&mut self, ino: u64) {
+        if let Some(pos) = self.nodes.iter().position(|e| e.ino == ino) {
+            self.nodes.remove(pos);
+        }
+    }
+
     pub fn add(&mut self, inode: INode) {
         self.nodes.push(inode);
     }
 
-    pub fn add_empty(&mut self, key: String, parent: u64) -> u64 {
+    pub fn add_empty(&mut self, key: String, hash: blake3::Hash, parent: u64) -> u64 {
         let ino = self.next_ino();
         self.nodes.push(INode::new(
             &key,
@@ -52,21 +62,22 @@ impl INodeTree {
             UNIX_EPOCH,
             FileType::RegularFile,
             parent,
+            hash,
         ));
         ino
     }
 
-    pub fn add_from_keys(&mut self, keys: Vec<String>, parent: Option<u64>) {
+    pub fn add_from_keys(&mut self, nodes: Vec<(blake3::Hash, String)>, parent: Option<u64>) {
         let parent = parent.unwrap_or(1);
-        for mut key in keys {
-            if key.contains("/") {
-                let pos_of_last = key.rfind("/").unwrap();
-                let folders = &key[..pos_of_last];
+        for mut node in nodes {
+            if node.1.contains("/") {
+                let pos_of_last = node.1.rfind("/").unwrap();
+                let folders = &node.1[..pos_of_last];
                 let parent = self.add_inode_dir(folders, None);
-                key = key[pos_of_last + 1..].to_string();
-                self.add_empty(key, parent);
+                node.1 = node.1[pos_of_last + 1..].to_string();
+                self.add_empty(node.1, node.0, parent);
             } else {
-                self.add_empty(key, parent);
+                self.add_empty(node.1, node.0, parent);
             }
         }
     }
@@ -89,9 +100,10 @@ impl INodeTree {
                 folder,
                 ino,
                 0,
-                UNIX_EPOCH,
+                SystemTime::now(),
                 FileType::Directory,
                 parent,
+                blake3::hash(b""),
             ));
             parent = next_ino;
         }
@@ -149,5 +161,73 @@ impl INodeTree {
             1 => Ok(file.first().unwrap()),
             _ => panic!("Error: Duplicate keys"),
         }
+    }
+
+    pub fn update_inode_hash(
+        &mut self,
+        ino: u64,
+        hash: blake3::Hash,
+    ) -> Result<(), INodeTreeError> {
+        if let Some(mut inode) = self
+            .nodes
+            .iter_mut()
+            .filter(|e| e.ino == ino)
+            .collect::<Vec<&mut INode>>()
+            .first_mut()
+        {
+            inode.hash = hash;
+            Ok(())
+        } else {
+            Err(INodeTreeError::new("File Not Found"))
+        }
+    }
+
+    pub fn update_inode_attr(
+        &mut self,
+        ino: u64,
+        mtime: SystemTime,
+        size: u64,
+    ) -> Result<(), INodeTreeError> {
+        if let Some(mut inode) = self
+            .nodes
+            .iter_mut()
+            .filter(|e| e.ino == ino)
+            .collect::<Vec<&mut INode>>()
+            .first_mut()
+        {
+            inode.mtime = mtime;
+            inode.size = size;
+            Ok(())
+        } else {
+            Err(INodeTreeError::new("File Not Found"))
+        }
+    }
+
+
+
+
+    pub fn write_all_to_string(&self) -> String {
+        let mut final_string = String::new();
+        for node in &self.nodes {
+            if node.kind == FileType::Directory {
+                continue;
+            }
+            let key = format!("\"{}\"", self.get_full_path(node.ino).unwrap());
+            let hash = node.hash.to_hex();
+            let string = format!("{}\t{}\n", hash, key);
+            final_string = final_string + &string;
+        }
+        final_string
+    }
+
+    pub fn get_hash_list(&self) -> Vec<blake3::Hash>{
+        let mut hashes = vec![];
+        for node in &self.nodes{
+            if node.kind == FileType::Directory {
+                continue;
+            }
+            hashes.push(node.hash.clone());
+        }
+        hashes
     }
 }
