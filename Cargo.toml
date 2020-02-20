@@ -1,5 +1,5 @@
 [package]
-name = "bbfs"
+name = "freefs"
 version = "0.1.0"
 authors = ["ajbt200128 <austin@cutedogs.org>"]
 edition = "2018"
@@ -18,3 +18,12 @@ tokio = "0.2.21"
 cdc = "0.1.0"
 blake3 = "0.3.3"
 hex = "0.4.2"
+grpcio = {path="../grpc-rs", features=["openssl"]}
+protobuf = "2.14.0"
+
+
+[build-dependencies]
+protoc-grpcio = "1.0.2"
+
+[patch.crates-io]
+grpcio-compiler = { path = "../grpc-rs/compiler", version = "0.5.0", default-features = false }

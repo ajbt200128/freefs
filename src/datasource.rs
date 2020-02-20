@@ -11,6 +11,7 @@ use std::{
     time::SystemTime,
 };
 use walkdir::WalkDir;
+use crate::keys_manager::KeysManager;
 
 #[derive(Debug)]
 pub struct DataSourceError {
@@ -57,6 +58,7 @@ pub enum Area {
 #[async_trait]
 pub trait DataSource {
     fn get_area_path(&self, area: &Area) -> &String;
+    fn get_keys_manager(&self) -> &KeysManager;
     fn get_data_from_source(&self, hash: &blake3::Hash) -> Result<Vec<u8>, DataSourceError>;
     async fn put_data_from_source(
         &self,
@@ -184,17 +186,21 @@ pub trait DataSource {
 
     fn get_data(&self, hash: &blake3::Hash) -> Result<Vec<u8>, DataSourceError> {
         println!("Get data: {}", hash.to_hex());
+        let data;
         if self.check_in_area(&hash, &Area::Stage) {
-            Ok(self.get_data_from_area(&hash, &Area::Stage).unwrap())
+            data = self.get_data_from_area(&hash, &Area::Stage).unwrap();
         } else if self.check_in_area(&hash, &Area::Transient) {
-            Ok(self.get_data_from_area(&hash, &Area::Transient).unwrap())
+            data = self.get_data_from_area(&hash, &Area::Transient).unwrap();
         } else {
             let block_data = self.get_data_from_source(&hash)?;
             self.put_data_area(&hash, &block_data, &Area::Transient);
-            Ok(block_data)
+            data = block_data;
         }
+        let data = self.get_keys_manager().decrypt(data, false);
+        Ok(data)
     }
     fn put_data(&self, data: Vec<u8>) -> blake3::Hash {
+        let data = self.get_keys_manager().encrypt(data, None, false);
         self.put_hash_data_area(&data, &Area::Stage)
     }
 
@@ -248,7 +254,7 @@ pub trait DataSource {
 
 pub mod sources {
     pub mod s3_bucket {
-        use crate::datasource::{Area, DataSource, DataSourceError};
+        use crate::{keys_manager::KeysManager, datasource::{Area, DataSource, DataSourceError}};
         use async_trait::async_trait;
         use s3::{bucket::Bucket, S3Error};
         use std::time::{Duration, UNIX_EPOCH};
@@ -265,14 +271,16 @@ pub mod sources {
             bucket: Bucket,
             transient_path: String,
             stage_path: String,
+            keys_manager:KeysManager,
         }
 
         impl BucketSource {
-            pub fn new(bucket: Bucket, transient_path: String, stage_path: String) -> Self {
+            pub fn new(bucket: Bucket, transient_path: String, stage_path: String,keys_manager:KeysManager) -> Self {
                 Self {
                     bucket,
                     transient_path,
                     stage_path,
+                    keys_manager
                 }
             }
         }
@@ -359,6 +367,9 @@ pub mod sources {
                     Ok(String::from_utf8(result).unwrap_or("".to_string()))
                 }
             }
+            fn get_keys_manager(&self) -> &crate::keys_manager::KeysManager {
+                &self.keys_manager
+    }
         }
     }
 }
