@@ -379,6 +379,7 @@ impl Filesystem for Files {
             reply.error(ENOTEMPTY);
         } else {
             self.inode_tree.remove(dir);
+            reply.ok();
         }
     }
     fn init(&mut self, _req: &Request<'_>) -> Result<(), libc::c_int> {

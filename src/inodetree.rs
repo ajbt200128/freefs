@@ -67,18 +67,24 @@ impl INodeTree {
         ino
     }
 
-    pub fn add_from_keys(&mut self, nodes: Vec<(blake3::Hash, String)>, parent: Option<u64>) {
-        let parent = parent.unwrap_or(1);
+    pub fn add_from_keys(
+        &mut self,
+        nodes: Vec<(blake3::Hash, String, FileType)>,
+        parent: Option<u64>,
+    ) {
+        let mut parent = parent.unwrap_or(1);
         for mut node in nodes {
+            if node.2 == FileType::Directory {
+                self.add_inode_dir(&node.1, None);
+                continue;
+            }
             if node.1.contains("/") {
                 let pos_of_last = node.1.rfind("/").unwrap();
                 let folders = &node.1[..pos_of_last];
-                let parent = self.add_inode_dir(folders, None);
+                parent = self.add_inode_dir(folders, None);
                 node.1 = node.1[pos_of_last + 1..].to_string();
-                self.add_empty(node.1, node.0, parent);
-            } else {
-                self.add_empty(node.1, node.0, parent);
             }
+            self.add_empty(node.1, node.0, parent);
         }
     }
 
@@ -203,26 +209,27 @@ impl INodeTree {
         }
     }
 
-
-
-
     pub fn write_all_to_string(&self) -> String {
         let mut final_string = String::new();
         for node in &self.nodes {
-            if node.kind == FileType::Directory {
-                continue;
-            }
+            let kind = match node.kind {
+                FileType::Directory => "dir".to_string(),
+                FileType::RegularFile => "file".to_string(),
+                _ => {
+                    continue;
+                }
+            };
             let key = format!("\"{}\"", self.get_full_path(node.ino).unwrap());
             let hash = node.hash.to_hex();
-            let string = format!("{}\t{}\n", hash, key);
+            let string = format!("{}\t{}\t{}\n", kind, hash, key);
             final_string = final_string + &string;
         }
         final_string
     }
 
-    pub fn get_hash_list(&self) -> Vec<blake3::Hash>{
+    pub fn get_hash_list(&self) -> Vec<blake3::Hash> {
         let mut hashes = vec![];
-        for node in &self.nodes{
+        for node in &self.nodes {
             if node.kind == FileType::Directory {
                 continue;
             }

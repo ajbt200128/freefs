@@ -1,6 +1,6 @@
-use crate::block_hash_map::BlockHashMap;
 use async_trait::async_trait;
 use blake3;
+use fuse::FileType;
 use futures::future::join_all;
 use std::{
     error::Error,
@@ -82,7 +82,7 @@ pub trait DataSource {
         };
     }
 
-    fn get_log(&self) -> Vec<(blake3::Hash, String)> {
+    fn get_log(&self) -> Vec<(blake3::Hash, String,FileType)> {
         let absolute_path = format!("{}/.log", self.get_area_path(&Area::Stage));
         let mut entries_string = String::new();
         if Path::new(&absolute_path).exists() {
@@ -92,13 +92,20 @@ pub trait DataSource {
         }
 
         let entries: Vec<&str> = entries_string.split("\n").collect();
-        let mut nodes: Vec<(blake3::Hash, String)> = vec![];
+        let mut nodes: Vec<(blake3::Hash, String, FileType)> = vec![];
         for entry in entries {
             let entry: Vec<&str> = entry.split("\t").collect();
-            if entry.len() == 2 {
-                let hash = hash_from_string(entry[0].to_string());
-                let key = entry[1][1..entry[1].len() - 1].to_string();
-                nodes.push((hash, key));
+            if entry.len() == 3 {
+                let kind = match entry[0] {
+                    "file" => FileType::RegularFile,
+                    "dir" => FileType::Directory,
+                    _ => {
+                        continue;
+                    }
+                };
+                let hash = hash_from_string(entry[1].to_string());
+                let key = entry[2][1..entry[2].len() - 1].to_string();
+                nodes.push((hash, key, kind));
             }
         }
         nodes
@@ -151,7 +158,7 @@ pub trait DataSource {
         let mut hashes = vec![];
         for e in dir.into_iter().filter_map(|e| e.ok()) {
             if e.metadata().unwrap().is_file() {
-                if e.file_name() == ".log"{
+                if e.file_name() == ".log" {
                     continue;
                 }
                 let string = e
@@ -206,11 +213,14 @@ pub trait DataSource {
         }
     }
 
-    async fn sync_stage_area(&self, valid_hashes:Vec<blake3::Hash>) -> Result<(), DataSourceError> {
+    async fn sync_stage_area(
+        &self,
+        valid_hashes: Vec<blake3::Hash>,
+    ) -> Result<(), DataSourceError> {
         let mut futs = vec![];
         let hashes = self.get_hashes_area(&Area::Stage)?;
         for hash in &hashes {
-            if !valid_hashes.contains(hash){
+            if !valid_hashes.contains(hash) {
                 self.delete_data_area(hash, &Area::Stage)?;
                 continue;
             }
@@ -238,10 +248,7 @@ pub trait DataSource {
 
 pub mod sources {
     pub mod s3_bucket {
-        use crate::{
-            block_hash_map::BlockHashMap,
-            datasource::{Area, DataSource, DataSourceError},
-        };
+        use crate::datasource::{Area, DataSource, DataSourceError};
         use async_trait::async_trait;
         use s3::{bucket::Bucket, S3Error};
         use std::time::{Duration, UNIX_EPOCH};
@@ -258,7 +265,6 @@ pub mod sources {
             bucket: Bucket,
             transient_path: String,
             stage_path: String,
-            block_hash_map: BlockHashMap,
         }
 
         impl BucketSource {
@@ -267,7 +273,6 @@ pub mod sources {
                     bucket,
                     transient_path,
                     stage_path,
-                    block_hash_map: BlockHashMap::new(),
                 }
             }
         }
@@ -339,7 +344,7 @@ pub mod sources {
             fn put_log_source(&self, log: String) -> Result<(), DataSourceError> {
                 let (_, code) =
                     self.bucket
-                    .put_object_blocking(".log", log.as_bytes(), "text/plain")?;
+                        .put_object_blocking(".log", log.as_bytes(), "text/plain")?;
                 if code != 200 {
                     Err(DataSourceError::new(&format!("Error wrong code: {}", code)))
                 } else {
