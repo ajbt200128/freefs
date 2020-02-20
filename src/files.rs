@@ -3,7 +3,7 @@ use fuse::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{ENOENT, ENOSYS};
+use libc::{ENOENT, ENOSYS, ENOTEMPTY};
 use s3::bucket::Bucket;
 use s3::serde_types::Object;
 use std::ffi::OsStr;
@@ -111,6 +111,7 @@ impl Files {
         let mut parent = 1;
         for folder in folders {
             let key = curr_path.clone() + folder;
+            curr_path = curr_path + folder + "/";
             match self.get_inode_from_key(&key) {
                 Ok(entry) => {
                     parent = entry.attr.ino;
@@ -118,10 +119,10 @@ impl Files {
                 }
                 _ => {}
             };
+
             let next_ino =
                 self.add_inode_table_entry(key, parent, 0, UNIX_EPOCH, FileType::Directory);
             parent = next_ino;
-            curr_path = curr_path + folder + "/";
         }
         parent
     }
@@ -137,8 +138,9 @@ impl Files {
                     let folders = &file.key[..pos_of_last];
                     parent = self.add_inode_table_entry_dir(folders);
                 }
-
-                self.add_inode_table_entry_obj(file, parent);
+                if !file.key.contains(".bzEmpty") {
+                    self.add_inode_table_entry_obj(file, parent);
+                }
             }
         }
     }
@@ -191,16 +193,33 @@ impl Files {
 }
 
 impl Filesystem for Files {
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        println!("flush {}", ino);
+        reply.ok();
+    }
+
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
+        println!("fsync {},{}", ino, datasync);
+        reply.ok();
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        println!("lookup: {:?}", name.to_str());
-        let attr =
-            match self.get_inode_from_name_parent(name.to_str().unwrap(), parent) {
-                Ok(entry) => &entry.attr,
-                Err(e) => {
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
+        println!("lookup: {:?}, {}", name.to_str(), parent);
+        let attr = match self.get_inode_from_name_parent(name.to_str().unwrap(), parent) {
+            Ok(entry) => &entry.attr,
+            Err(e) => {
+                //println!("lookup ERROR: {}", e);
+                reply.error(ENOENT);
+                return;
+            }
+        };
         reply.entry(&Duration::from_secs(1), attr, 0);
     }
 
@@ -210,7 +229,7 @@ impl Filesystem for Files {
             Ok(entry) => &entry.attr,
             Err(e) => {
                 println!("gettattr ERROR");
-                reply.error(ENOSYS);
+                reply.error(ENOENT);
                 return;
             }
         };
@@ -236,11 +255,11 @@ impl Filesystem for Files {
         reply: ReplyAttr,
     ) {
         println!("Set attr{:?}", ino);
-        let attr = match self.get_inode_from_ino(ino){
+        let attr = match self.get_inode_from_ino(ino) {
             Ok(entry) => entry.attr,
             Err(e) => {
                 println!("setattr ERROR");
-                reply.error(ENOSYS);
+                reply.error(ENOENT);
                 return;
             }
         };
@@ -253,28 +272,32 @@ impl Filesystem for Files {
         ino: u64,
         _fh: u64,
         offset: i64,
-        _size: u32,
+        size: u32,
         reply: ReplyData,
     ) {
-        println!("read {:?} {:?}", ino, offset);
+        let end = (offset + size as i64) as usize;
+        println!("read {:?} {:?}, {}", ino, offset, size);
         let file_key = match self.get_inode_from_ino(ino) {
             Ok(entry) => &entry.key,
             Err(e) => {
-                println!("read ERROR");
-                reply.error(ENOSYS);
+                println!("read ERROR: {}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
-        let (blocks, code) = match self.bucket.get_object_blocking(&file_key){
+        let (mut blocks, code) = match self.bucket.get_object_blocking(&file_key) {
             Ok(result) => result,
             Err(e) => {
-                println!("Read error!");
-                reply.error(ENOSYS);
+                println!("read ERROR: {}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
         assert_eq!(code, 200);
-        let data = &blocks[offset as usize..];
+        if blocks.len() < end {
+            blocks.resize(end, 0);
+        }
+        let data = &blocks[offset as usize..end];
         reply.data(data);
     }
 
@@ -292,7 +315,7 @@ impl Filesystem for Files {
             Ok(entry) => entry,
             Err(e) => {
                 println!("gettattr ERROR");
-                reply.error(ENOSYS);
+                reply.error(ENOENT);
                 return;
             }
         };
@@ -336,16 +359,16 @@ impl Filesystem for Files {
         let file = match self.get_inode_from_ino(ino) {
             Ok(entry) => entry,
             Err(e) => {
-                println!("write ERROR: {}",e);
-                reply.error(ENOSYS);
+                println!("write ERROR: {}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
-        let (mut blocks, code) = match self.bucket.get_object_blocking(&file.key){
+        let (mut blocks, code) = match self.bucket.get_object_blocking(&file.key) {
             Ok(result) => result,
             Err(e) => {
-                println!("write ERROR:{}",e);
-                reply.error(ENOSYS);
+                println!("write ERROR:{}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
@@ -355,13 +378,15 @@ impl Filesystem for Files {
             blocks.resize(buffer, 0);
         }
         blocks.splice(offset..(data.len() + offset), data.to_vec());
-        let (_, code) = match self
-            .bucket
-            .put_object_blocking(&file.key, blocks.as_slice(), "text/plain") {
+        let (_, code) =
+            match self
+                .bucket
+                .put_object_blocking(&file.key, blocks.as_slice(), "text/plain")
+            {
                 Ok(result) => result,
                 Err(e) => {
-                    println!("write ERROR:{}",e);
-                    reply.error(ENOSYS);
+                    println!("write ERROR:{}", e);
+                    reply.error(ENOENT);
                     return;
                 }
             };
@@ -384,8 +409,8 @@ impl Filesystem for Files {
         let parent_name = match self.get_inode_from_ino(parent) {
             Ok(entry) => entry.key.clone(),
             Err(e) => {
-                println!("create ERROR:{}",e);
-                reply.error(ENOSYS);
+                println!("create ERROR:{}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
@@ -395,16 +420,14 @@ impl Filesystem for Files {
             parent_name
         };
         let key = format!("{}{}", parent_name, name);
-        let (_, code) = match self
-            .bucket
-            .put_object_blocking(&key, &[], "text/plain") {
-                Ok(result) => result,
-                Err(e) => {
-                    println!("create ERROR:{}",e);
-                    reply.error(ENOSYS);
-                    return;
-                }
-            };
+        let (_, code) = match self.bucket.put_object_blocking(&key, &[], "text/plain") {
+            Ok(result) => result,
+            Err(e) => {
+                println!("create ERROR:{}", e);
+                reply.error(ENOENT);
+                return;
+            }
+        };
         assert_eq!(code, 200);
 
         let file_ino =
@@ -412,8 +435,8 @@ impl Filesystem for Files {
         let attr = match self.get_inode_from_ino(file_ino) {
             Ok(entry) => entry.attr,
             Err(e) => {
-                println!("create ERROR:{}",e);
-                reply.error(ENOSYS);
+                println!("create ERROR:{}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
@@ -423,24 +446,99 @@ impl Filesystem for Files {
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         println!("Unlink {:?}, {:?}", name, parent);
-        let key = match self
-            .get_inode_from_name_parent(name.to_str().unwrap(), parent) {
-                Ok(entry) => &entry.key,
-                Err(e) => {
-                    println!("unlink ERROR:{}",e);
-                    reply.error(ENOSYS);
-                    return;
-                }
-            };
+        let key = match self.get_inode_from_name_parent(name.to_str().unwrap(), parent) {
+            Ok(entry) => &entry.key,
+            Err(e) => {
+                println!("unlink ERROR:{}", e);
+                reply.error(ENOENT);
+                return;
+            }
+        };
         let (res, code) = match self.bucket.delete_object_blocking(key) {
             Ok(result) => result,
             Err(e) => {
-                println!("unlink ERROR:{}",e);
-                reply.error(ENOSYS);
+                println!("unlink ERROR:{}", e);
+                reply.error(ENOENT);
                 return;
             }
         };
         assert_eq!(204, code);
         reply.ok();
+    }
+    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
+        let name = name.to_str().unwrap();
+        println!("mkdir {}, {}", parent, name);
+        let parent_name = match self.get_inode_from_ino(parent) {
+            Ok(entry) => entry.key.clone(),
+            Err(e) => {
+                println!("mkdir ERROR: {}", e);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        let parent_name = if parent_name != "" {
+            format!("{}/", parent_name)
+        } else {
+            parent_name
+        };
+        let dir = parent_name + name;
+        let empty_placeholder = format!("{}/.bzEmpty", &dir);
+        let (res, code) =
+            match self
+                .bucket
+                .put_object_blocking(&empty_placeholder, &[], "text/plain")
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    println!("mkdir ERROR: {}", e);
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+        let dir_ino = self.add_inode_table_entry_dir(&dir);
+        /*self.add_inode_table_entry(
+            empty_placeholder,
+            dir_ino,
+            0,
+            UNIX_EPOCH,
+            FileType::RegularFile,
+        );*/
+        let attr = self.get_inode_from_ino(dir_ino).unwrap().attr;
+        reply.entry(&Duration::from_secs(1), &attr, 0)
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_str().unwrap();
+        println!("rmdir {}, {}", parent, name);
+        let dir = match self.get_inode_from_name_parent(name, parent) {
+            Ok(entry) => entry,
+            Err(e) => {
+                println!("rmdir ERROR: {}", e);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        let children_count = self
+            .inode_table
+            .iter()
+            .filter(|e| e.parent == dir.attr.ino)
+            .count();
+        if children_count > 0 {
+            reply.error(ENOTEMPTY);
+        } else {
+            let (result, code) = match self
+                .bucket
+                .delete_object_blocking(format!("{}/.bzEmpty", &dir.key))
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    println!("rmdir ERROR: {}", e);
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+            assert_eq!(204, code);
+            reply.ok();
+        }
     }
 }

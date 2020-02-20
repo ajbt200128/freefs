@@ -18,7 +18,7 @@ fn main() {
         bucket: "rust-test".to_string(),
     };
     let bucket = create_bucket(bb);
-    let files = bucket.list_blocking("".to_string(), None).unwrap();
+    let files = bucket.list_blocking("test-folder".to_string(), None).unwrap();
     for (i, (file,code)) in files.iter().enumerate(){
         assert_eq!(&200, code);
         //println!("{:?}",&file);
@@ -27,8 +27,6 @@ fn main() {
             println!("{:?}",obj.key);
         }
     }
-    //assert_eq!(200, code);
-    //println!("{:?}",code);
     let mountpoint = Path::new("/tmp/rust-test");
     let fs = Files::new(bucket);
     mount(mountpoint,fs);
