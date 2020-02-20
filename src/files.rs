@@ -1,3 +1,4 @@
+use crate::{inode::INode, inodetree::INodeTree};
 use chrono::DateTime;
 use fuse::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -15,12 +16,12 @@ use std::{
 };
 
 #[derive(Debug)]
-struct FileSysError {
+pub struct FileSysError {
     msg: String,
 }
 
 impl FileSysError {
-    fn new(msg: &str) -> Self {
+    pub fn new(msg: &str) -> Self {
         Self {
             msg: msg.to_string(),
         }
@@ -35,33 +36,20 @@ impl fmt::Display for FileSysError {
     }
 }
 
-struct INode {
-    key: String,
-    attr: FileAttr,
-    parent: u64,
-}
-
 pub struct Files {
     bucket: Bucket,
-    inode_table: Vec<INode>,
+    inode_tree: INodeTree,
 }
 
 impl Files {
     pub fn new(bucket: Bucket) -> Self {
         let mut new = Files {
             bucket,
-            inode_table: vec![],
+            inode_tree: INodeTree::new(),
         };
         new.add_inode_table_entry("".to_string(), 0, 0, UNIX_EPOCH, FileType::Directory);
         new.load_dir_inode_table("");
         new
-    }
-
-    fn next_inode(&self) -> u64 {
-        match self.inode_table.last() {
-            Some(entry) => entry.attr.ino + 1,
-            _ => 1,
-        }
     }
 
     fn add_inode_table_entry_obj(&mut self, file: Object, parent: u64) -> u64 {
@@ -80,28 +68,9 @@ impl Files {
         mtime: SystemTime,
         kind: FileType,
     ) -> u64 {
-        let next_ino = self.next_inode();
-        let entry = INode {
-            key,
-            attr: FileAttr {
-                ino: next_ino,
-                size,
-                blocks: (size * 10 / 4096) / 10,
-                atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                mtime,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind,
-                perm: 0o755,
-                nlink: 0,
-                uid: 501,
-                gid: 20,
-                rdev: 0,
-                flags: 0,
-            },
-            parent,
-        };
-        self.inode_table.push(entry);
+        let next_ino = self.inode_tree.next_inode();
+        let entry = INode::new(&key, next_ino, size, mtime, kind, parent);
+        self.inode_tree.add(entry);
         next_ino
     }
 
@@ -112,9 +81,9 @@ impl Files {
         for folder in folders {
             let key = curr_path.clone() + folder;
             curr_path = curr_path + folder + "/";
-            match self.get_inode_from_key(&key) {
+            match self.inode_tree.get_inode_from_key(&key) {
                 Ok(entry) => {
-                    parent = entry.attr.ino;
+                    parent = entry.ino;
                     continue;
                 }
                 _ => {}
@@ -144,52 +113,6 @@ impl Files {
             }
         }
     }
-
-    fn get_inode_from_key(&self, name: &str) -> Result<&INode, FileSysError> {
-        let file: Vec<&INode> = self.inode_table.iter().filter(|e| e.key == name).collect();
-        match file.len() {
-            0 => Err(FileSysError::new("File Not Found")),
-            1 => Ok(file.first().unwrap()),
-            _ => panic!("Error: Duplicate keys"),
-        }
-    }
-
-    fn get_inode_from_ino(&self, ino: u64) -> Result<&INode, FileSysError> {
-        let file: Vec<&INode> = self
-            .inode_table
-            .iter()
-            .filter(|e| e.attr.ino == ino)
-            .collect();
-        match file.len() {
-            0 => Err(FileSysError::new("File Not Found")),
-            1 => Ok(file.first().unwrap()),
-            _ => panic!("Error: Duplicate keys"),
-        }
-    }
-
-    fn get_inode_from_name_parent(
-        &self,
-        name: &str,
-        parent_ino: u64,
-    ) -> Result<&INode, FileSysError> {
-        let mut parent_name = self.get_inode_from_ino(parent_ino)?.key.clone();
-        parent_name = if parent_name != "" {
-            format!("{}/", parent_name)
-        } else {
-            parent_name
-        };
-        let file: Vec<&INode> = self
-            .inode_table
-            .iter()
-            .filter(|e| e.parent == parent_ino)
-            .filter(|e| e.key == format!("{}{}", parent_name, &name))
-            .collect();
-        match file.len() {
-            0 => Err(FileSysError::new("File Not Found")),
-            1 => Ok(file.first().unwrap()),
-            _ => panic!("Error: Duplicate keys"),
-        }
-    }
 }
 
 impl Filesystem for Files {
@@ -212,21 +135,24 @@ impl Filesystem for Files {
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup: {:?}, {}", name.to_str(), parent);
-        let attr = match self.get_inode_from_name_parent(name.to_str().unwrap(), parent) {
-            Ok(entry) => &entry.attr,
+        let attr = match self
+            .inode_tree
+            .get_inode_from_name_parent(name.to_str().unwrap(), parent)
+        {
+            Ok(entry) => entry.getFileAttr(),
             Err(e) => {
                 //println!("lookup ERROR: {}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        reply.entry(&Duration::from_secs(1), attr, 0);
+        reply.entry(&Duration::from_secs(1), &attr, 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         println!("getattr(ino={})", ino);
-        let attr = match self.get_inode_from_ino(ino) {
-            Ok(entry) => &entry.attr,
+        let attr = match self.inode_tree.get_inode_from_ino(ino) {
+            Ok(entry) => entry.getFileAttr(),
             Err(e) => {
                 println!("gettattr ERROR");
                 reply.error(ENOENT);
@@ -255,8 +181,8 @@ impl Filesystem for Files {
         reply: ReplyAttr,
     ) {
         println!("Set attr{:?}", ino);
-        let attr = match self.get_inode_from_ino(ino) {
-            Ok(entry) => entry.attr,
+        let attr = match self.inode_tree.get_inode_from_ino(ino) {
+            Ok(entry) => entry.getFileAttr(),
             Err(e) => {
                 println!("setattr ERROR");
                 reply.error(ENOENT);
@@ -277,7 +203,7 @@ impl Filesystem for Files {
     ) {
         let end = (offset + size as i64) as usize;
         println!("read {:?} {:?}, {}", ino, offset, size);
-        let file_key = match self.get_inode_from_ino(ino) {
+        let file_key = match self.inode_tree.get_inode_from_ino(ino) {
             Ok(entry) => &entry.key,
             Err(e) => {
                 println!("read ERROR: {}", e);
@@ -311,7 +237,7 @@ impl Filesystem for Files {
     ) {
         println!("readdir: {:?}  \n offset: {:?}", ino, offset);
 
-        let dir = match self.get_inode_from_ino(ino) {
+        let dir = match self.inode_tree.get_inode_from_ino(ino) {
             Ok(entry) => entry,
             Err(e) => {
                 println!("gettattr ERROR");
@@ -320,21 +246,26 @@ impl Filesystem for Files {
             }
         };
 
-        let entries = self.inode_table.iter().filter(|e| e.parent == ino);
+        let entries = self.inode_tree.get_children(dir.ino);
 
-        for (i, entry) in entries.enumerate().skip(offset as usize) {
-            if i == 0 && ino == 1 {
+        for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+            if i == 0 && dir.ino == 1 {
                 reply.add(1, 1, FileType::Directory, &Path::new("."));
                 reply.add(1, 2, FileType::Directory, &Path::new(".."));
                 continue;
             }
             reply.add(
-                entry.attr.ino,
+                entry.ino,
                 i as i64 + 1,
-                entry.attr.kind,
+                entry.kind,
                 &Path::new(&entry.key.replace(&format!("{}{}", dir.key, "/"), "")),
             );
-            println!("{:?}: Adding {:?}, {:?}", i, entry.key, entry.attr.ino);
+            println!(
+                "{:?}: Adding {:?}, {:?}",
+                i,
+                entry.key,
+                entry.getFileAttr().ino
+            );
         }
         reply.ok();
     }
@@ -356,7 +287,7 @@ impl Filesystem for Files {
     ) {
         println!("Write: {:?}, {:?}, {:?} bytes", ino, offset, data.len());
         let offset = offset as usize;
-        let file = match self.get_inode_from_ino(ino) {
+        let file = match self.inode_tree.get_inode_from_ino(ino) {
             Ok(entry) => entry,
             Err(e) => {
                 println!("write ERROR: {}", e);
@@ -406,7 +337,7 @@ impl Filesystem for Files {
         println!("Create: {:?},{:?}", name, parent);
         let name = name.to_str().unwrap();
 
-        let parent_name = match self.get_inode_from_ino(parent) {
+        let parent_name = match self.inode_tree.get_inode_from_ino(parent) {
             Ok(entry) => entry.key.clone(),
             Err(e) => {
                 println!("create ERROR:{}", e);
@@ -432,8 +363,8 @@ impl Filesystem for Files {
 
         let file_ino =
             self.add_inode_table_entry(key, parent, 0, UNIX_EPOCH, FileType::RegularFile);
-        let attr = match self.get_inode_from_ino(file_ino) {
-            Ok(entry) => entry.attr,
+        let attr = match self.inode_tree.get_inode_from_ino(file_ino) {
+            Ok(entry) => entry.getFileAttr(),
             Err(e) => {
                 println!("create ERROR:{}", e);
                 reply.error(ENOENT);
@@ -446,7 +377,10 @@ impl Filesystem for Files {
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         println!("Unlink {:?}, {:?}", name, parent);
-        let key = match self.get_inode_from_name_parent(name.to_str().unwrap(), parent) {
+        let key = match self
+            .inode_tree
+            .get_inode_from_name_parent(name.to_str().unwrap(), parent)
+        {
             Ok(entry) => &entry.key,
             Err(e) => {
                 println!("unlink ERROR:{}", e);
@@ -468,7 +402,7 @@ impl Filesystem for Files {
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
         let name = name.to_str().unwrap();
         println!("mkdir {}, {}", parent, name);
-        let parent_name = match self.get_inode_from_ino(parent) {
+        let parent_name = match self.inode_tree.get_inode_from_ino(parent) {
             Ok(entry) => entry.key.clone(),
             Err(e) => {
                 println!("mkdir ERROR: {}", e);
@@ -503,14 +437,18 @@ impl Filesystem for Files {
             UNIX_EPOCH,
             FileType::RegularFile,
         );*/
-        let attr = self.get_inode_from_ino(dir_ino).unwrap().attr;
+        let attr = self
+            .inode_tree
+            .get_inode_from_ino(dir_ino)
+            .unwrap()
+            .getFileAttr();
         reply.entry(&Duration::from_secs(1), &attr, 0)
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_str().unwrap();
         println!("rmdir {}, {}", parent, name);
-        let dir = match self.get_inode_from_name_parent(name, parent) {
+        let dir = match self.inode_tree.get_inode_from_name_parent(name, parent) {
             Ok(entry) => entry,
             Err(e) => {
                 println!("rmdir ERROR: {}", e);
@@ -518,11 +456,7 @@ impl Filesystem for Files {
                 return;
             }
         };
-        let children_count = self
-            .inode_table
-            .iter()
-            .filter(|e| e.parent == dir.attr.ino)
-            .count();
+        let children_count = self.inode_tree.get_children(dir.ino).iter().count();
         if children_count > 0 {
             reply.error(ENOTEMPTY);
         } else {
