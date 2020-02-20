@@ -318,7 +318,13 @@ impl Filesystem for Files {
                 return;
             }
         };
-        let code = self.data_source.delete_data(&full_path);
+        match block_on(self.data_source.delete_data(&full_path)) {
+            Err(e) => {
+                println!("unlink ERROR: {}",e);
+            },
+            _ => {}
+        };
+        
         reply.ok();
     }
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {

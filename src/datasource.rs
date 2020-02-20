@@ -91,7 +91,9 @@ pub trait DataSource {
 
     fn delete_data_area(&self, path: &str, area: &Area) -> Result<(), DataSourceError> {
         let absolute_path = format!("{}/{}", self.get_area_path(area), path);
-        fs::remove_file(&absolute_path)?;
+        if Path::new(&absolute_path).exists() {
+            fs::remove_file(&absolute_path)?;
+        }
         Ok(())
     }
 
@@ -287,7 +289,7 @@ pub mod sources {
                 let time = chrono::DateTime::parse_from_rfc3339(&obj.last_modified).unwrap();
                 let time = UNIX_EPOCH + Duration::from_millis(time.timestamp_millis() as u64);
                 let size = obj.size;
-                Ok((size,time))
+                Ok((size, time))
             }
         }
     }
