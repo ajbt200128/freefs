@@ -1,3 +1,4 @@
+use crate::keys_manager::KeysManager;
 use async_trait::async_trait;
 use blake3;
 use fuse::FileType;
@@ -11,7 +12,6 @@ use std::{
     time::SystemTime,
 };
 use walkdir::WalkDir;
-use crate::keys_manager::KeysManager;
 
 #[derive(Debug)]
 pub struct DataSourceError {
@@ -70,13 +70,16 @@ pub trait DataSource {
         &self,
         hash: &blake3::Hash,
     ) -> Result<(u64, SystemTime), DataSourceError>;
-    fn put_log_source(&self, log: String) -> Result<(), DataSourceError>;
-    fn get_log_source(&self) -> Result<String, DataSourceError>;
+    fn put_log_source(&self, log: Vec<u8>) -> Result<(), DataSourceError>;
+    fn get_log_source(&self) -> Result<Vec<u8>, DataSourceError>;
 
     fn put_log(&self, log: String) {
+        let log = self
+            .get_keys_manager()
+            .encrypt(log.as_bytes().to_vec(), None, false);
         let absolute_path = format!("{}/.log", self.get_area_path(&Area::Stage));
         let mut file = File::create(&absolute_path).unwrap();
-        match file.write_all(log.as_bytes()) {
+        match file.write_all(&log) {
             Ok(()) => {}
             Err(e) => {
                 println!("Error writing to log {}", e);
@@ -84,15 +87,21 @@ pub trait DataSource {
         };
     }
 
-    fn get_log(&self) -> Vec<(blake3::Hash, String,FileType)> {
+    fn get_log(&self) -> Vec<(blake3::Hash, String, FileType)> {
         let absolute_path = format!("{}/.log", self.get_area_path(&Area::Stage));
-        let mut entries_string = String::new();
+        let entries_enc;
         if Path::new(&absolute_path).exists() {
-            entries_string = fs::read_to_string(&absolute_path).unwrap();
+            entries_enc = fs::read(&absolute_path).unwrap();
         } else {
-            entries_string = self.get_log_source().unwrap_or(String::new());
+            entries_enc = match self.get_log_source() {
+                Ok(log) => log,
+                _ => return vec![],
+            };
         }
-
+        let entries_enc = self
+            .get_keys_manager()
+            .decrypt(entries_enc, false);
+        let entries_string = std::str::from_utf8(&entries_enc).unwrap();
         let entries: Vec<&str> = entries_string.split("\n").collect();
         let mut nodes: Vec<(blake3::Hash, String, FileType)> = vec![];
         for entry in entries {
@@ -238,7 +247,7 @@ pub trait DataSource {
         }
         let log_path = format!("{}/.log", self.get_area_path(&Area::Stage));
         if Path::new(&log_path).exists() {
-            let data = fs::read_to_string(&log_path).unwrap();
+            let data = fs::read(&log_path).unwrap();
             self.put_log_source(data)?;
             fs::remove_file(&log_path)?;
         }
@@ -254,7 +263,10 @@ pub trait DataSource {
 
 pub mod sources {
     pub mod s3_bucket {
-        use crate::{keys_manager::KeysManager, datasource::{Area, DataSource, DataSourceError}};
+        use crate::{
+            datasource::{Area, DataSource, DataSourceError},
+            keys_manager::KeysManager,
+        };
         use async_trait::async_trait;
         use s3::{bucket::Bucket, S3Error};
         use std::time::{Duration, UNIX_EPOCH};
@@ -271,16 +283,21 @@ pub mod sources {
             bucket: Bucket,
             transient_path: String,
             stage_path: String,
-            keys_manager:KeysManager,
+            keys_manager: KeysManager,
         }
 
         impl BucketSource {
-            pub fn new(bucket: Bucket, transient_path: String, stage_path: String,keys_manager:KeysManager) -> Self {
+            pub fn new(
+                bucket: Bucket,
+                transient_path: String,
+                stage_path: String,
+                keys_manager: KeysManager,
+            ) -> Self {
                 Self {
                     bucket,
                     transient_path,
                     stage_path,
-                    keys_manager
+                    keys_manager,
                 }
             }
         }
@@ -349,27 +366,27 @@ pub mod sources {
                 Ok((size, time))
             }
 
-            fn put_log_source(&self, log: String) -> Result<(), DataSourceError> {
+            fn put_log_source(&self, log: Vec<u8>) -> Result<(), DataSourceError> {
                 let (_, code) =
                     self.bucket
-                        .put_object_blocking(".log", log.as_bytes(), "text/plain")?;
+                        .put_object_blocking(".log", &log, "text/plain")?;
                 if code != 200 {
                     Err(DataSourceError::new(&format!("Error wrong code: {}", code)))
                 } else {
                     Ok(())
                 }
             }
-            fn get_log_source(&self) -> Result<String, DataSourceError> {
+            fn get_log_source(&self) -> Result<Vec<u8>, DataSourceError> {
                 let (result, code) = self.bucket.get_object_blocking(".log")?;
                 if code != 200 {
                     Err(DataSourceError::new(&format!("Error wrong code: {}", code)))
                 } else {
-                    Ok(String::from_utf8(result).unwrap_or("".to_string()))
+                    Ok(result)
                 }
             }
             fn get_keys_manager(&self) -> &crate::keys_manager::KeysManager {
                 &self.keys_manager
-    }
+            }
         }
     }
 }
