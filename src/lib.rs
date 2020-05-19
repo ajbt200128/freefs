@@ -4,6 +4,7 @@ use s3::region::Region;
 pub mod files;
 pub mod inode;
 pub mod inodetree;
+pub mod datasource;
 
 pub struct Storage {
     pub name: String,

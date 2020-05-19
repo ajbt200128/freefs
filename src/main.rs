@@ -3,8 +3,7 @@ use s3::region::Region;
 use std::path::Path;
 use s3::creds::Credentials;
 
-use bbfs::{files::Files,Storage};
-
+use bbfs::{files::Files,Storage, datasource::sources::s3_bucket::BucketSource};
 
 
 fn main() {
@@ -28,7 +27,8 @@ fn main() {
         }
     }
     let mountpoint = Path::new("/tmp/rust-test");
-    let fs = Files::new(bucket);
+    let data_source = BucketSource::new(bucket,"/tmp/rust-test-transient".to_string(),"/tmp/rust-test-stage".to_string());
+    let fs = Files::new(data_source);
     mount(mountpoint,fs);
 
 }

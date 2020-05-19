@@ -1,117 +1,70 @@
-use crate::{inode::INode, inodetree::INodeTree};
-use chrono::DateTime;
+use crate::{
+    datasource::{sources::s3_bucket::BucketSource, DataSource},
+    inode::INode,
+    inodetree::INodeTree,
+};
 use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{ENOENT, ENOSYS, ENOTEMPTY};
-use s3::bucket::Bucket;
-use s3::serde_types::Object;
+use libc::{ENOENT, ENOTEMPTY};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::{
-    error::Error,
-    fmt,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
-#[derive(Debug)]
-pub struct FileSysError {
-    msg: String,
-}
-
-impl FileSysError {
-    pub fn new(msg: &str) -> Self {
-        Self {
-            msg: msg.to_string(),
-        }
-    }
-}
-
-impl Error for FileSysError {}
-
-impl fmt::Display for FileSysError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "File error {}!", self.msg)
-    }
-}
+use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, thread, mem};
+use futures::executor::block_on;
 
 pub struct Files {
-    bucket: Bucket,
+    data_source: Arc<BucketSource>,
     inode_tree: INodeTree,
 }
 
 impl Files {
-    pub fn new(bucket: Bucket) -> Self {
+    pub fn new(data_source: BucketSource) -> Self {
         let mut new = Files {
-            bucket,
+            data_source:Arc::new(data_source),
             inode_tree: INodeTree::new(),
         };
-        new.add_inode_table_entry("".to_string(), 0, 0, UNIX_EPOCH, FileType::Directory);
-        new.load_dir_inode_table("");
+        new.inode_tree.add(INode::new(
+            "",
+            1,
+            0,
+            UNIX_EPOCH,
+            FileType::Directory,
+            0,
+        ));
+        new.inode_tree
+            .add_from_keys(new.data_source.get_keys("").unwrap(), None);
+        let mut nodes = new.inode_tree.nodes.clone();
+        for node in &mut nodes{
+            if node.kind != FileType::Directory{
+                let path = new.inode_tree.get_full_path(node.ino).unwrap();
+                let (size,mtime) = new.data_source.get_data_attr(&path).unwrap_or((0,UNIX_EPOCH));
+               node.size = size;
+               node.mtime = mtime;
+            }
+        }
+        new.inode_tree.nodes = nodes;
         new
     }
 
-    fn add_inode_table_entry_obj(&mut self, file: Object, parent: u64) -> u64 {
-        let mtime = DateTime::parse_from_rfc3339(&file.last_modified).unwrap();
-        let mtime = UNIX_EPOCH + Duration::from_millis(mtime.timestamp_millis() as u64);
-        let next_ino =
-            self.add_inode_table_entry(file.key, parent, file.size, mtime, FileType::RegularFile);
-        next_ino
-    }
-
-    fn add_inode_table_entry(
-        &mut self,
-        key: String,
-        parent: u64,
-        size: u64,
-        mtime: SystemTime,
-        kind: FileType,
-    ) -> u64 {
-        let next_ino = self.inode_tree.next_inode();
-        let entry = INode::new(&key, next_ino, size, mtime, kind, parent);
-        self.inode_tree.add(entry);
-        next_ino
-    }
-
-    fn add_inode_table_entry_dir(&mut self, dir: &str) -> u64 {
-        let folders = dir.split("/");
-        let mut curr_path = "".to_string();
-        let mut parent = 1;
-        for folder in folders {
-            let key = curr_path.clone() + folder;
-            curr_path = curr_path + folder + "/";
-            match self.inode_tree.get_inode_from_key(&key) {
-                Ok(entry) => {
-                    parent = entry.ino;
-                    continue;
-                }
-                _ => {}
-            };
-
-            let next_ino =
-                self.add_inode_table_entry(key, parent, 0, UNIX_EPOCH, FileType::Directory);
-            parent = next_ino;
-        }
-        parent
-    }
-
-    fn load_dir_inode_table(&mut self, dir: &str) {
-        let files = self.bucket.list_blocking(dir.to_string(), None).unwrap();
-        for (list, code) in files {
-            assert_eq!(200, code);
-            for file in list.contents {
-                let mut parent = 1;
-                if file.key.contains("/") {
-                    let pos_of_last = file.key.rfind("/").unwrap();
-                    let folders = &file.key[..pos_of_last];
-                    parent = self.add_inode_table_entry_dir(folders);
-                }
-                if !file.key.contains(".bzEmpty") {
-                    self.add_inode_table_entry_obj(file, parent);
-                }
+    fn sync_path(&self, ino:u64){
+        let path = match self.inode_tree.get_full_path(ino) {
+            Ok(path) => path,
+            Err(e) => {
+                println!("flush ERROR: {}",e);
+                return
             }
+        };
+        let data_source = Arc::clone(&self.data_source);
+        thread::spawn(move||{
+            match block_on(data_source.sync_stage_area(&path)) {
+                Err(e) => {
+                    println!("Sync ERROR: {}",e);
+                },
+                _ => {},
+            };
         }
+        );
     }
 }
 
@@ -125,6 +78,7 @@ impl Filesystem for Files {
         reply: ReplyEmpty,
     ) {
         println!("flush {}", ino);
+        self.sync_path(ino);
         reply.ok();
     }
 
@@ -135,24 +89,25 @@ impl Filesystem for Files {
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup: {:?}, {}", name.to_str(), parent);
-        let attr = match self
+
+        let entry = match self
             .inode_tree
-            .get_inode_from_name_parent(name.to_str().unwrap(), parent)
+            .get_inode_from_key_parent(name.to_str().unwrap(), parent)
         {
-            Ok(entry) => entry.getFileAttr(),
+            Ok(entry) => entry,
             Err(e) => {
                 //println!("lookup ERROR: {}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        reply.entry(&Duration::from_secs(1), &attr, 0);
+        reply.entry(&Duration::from_secs(1), &entry.get_file_attr(), 0);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         println!("getattr(ino={})", ino);
         let attr = match self.inode_tree.get_inode_from_ino(ino) {
-            Ok(entry) => entry.getFileAttr(),
+            Ok(entry) => entry.get_file_attr(),
             Err(e) => {
                 println!("gettattr ERROR");
                 reply.error(ENOENT);
@@ -182,7 +137,7 @@ impl Filesystem for Files {
     ) {
         println!("Set attr{:?}", ino);
         let attr = match self.inode_tree.get_inode_from_ino(ino) {
-            Ok(entry) => entry.getFileAttr(),
+            Ok(entry) => entry.get_file_attr(),
             Err(e) => {
                 println!("setattr ERROR");
                 reply.error(ENOENT);
@@ -203,15 +158,15 @@ impl Filesystem for Files {
     ) {
         let end = (offset + size as i64) as usize;
         println!("read {:?} {:?}, {}", ino, offset, size);
-        let file_key = match self.inode_tree.get_inode_from_ino(ino) {
-            Ok(entry) => &entry.key,
+        let path = match self.inode_tree.get_full_path(ino) {
+            Ok(path) => path,
             Err(e) => {
                 println!("read ERROR: {}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        let (mut blocks, code) = match self.bucket.get_object_blocking(&file_key) {
+        let mut blocks = match self.data_source.get_data(&path) {
             Ok(result) => result,
             Err(e) => {
                 println!("read ERROR: {}", e);
@@ -219,7 +174,6 @@ impl Filesystem for Files {
                 return;
             }
         };
-        assert_eq!(code, 200);
         if blocks.len() < end {
             blocks.resize(end, 0);
         }
@@ -246,26 +200,17 @@ impl Filesystem for Files {
             }
         };
 
-        let entries = self.inode_tree.get_children(dir.ino);
+        let mut entries = vec![dir];
+        entries.append(&mut self.inode_tree.get_children(dir.ino));
 
         for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-            if i == 0 && dir.ino == 1 {
-                reply.add(1, 1, FileType::Directory, &Path::new("."));
-                reply.add(1, 2, FileType::Directory, &Path::new(".."));
+            if i == 0 {
+                reply.add(dir.ino, 1, FileType::Directory, &Path::new("."));
+                reply.add(dir.ino, 2, FileType::Directory, &Path::new(".."));
                 continue;
             }
-            reply.add(
-                entry.ino,
-                i as i64 + 1,
-                entry.kind,
-                &Path::new(&entry.key.replace(&format!("{}{}", dir.key, "/"), "")),
-            );
-            println!(
-                "{:?}: Adding {:?}, {:?}",
-                i,
-                entry.key,
-                entry.getFileAttr().ino
-            );
+            reply.add(entry.ino, i as i64 + 1, entry.kind, &Path::new(&entry.key));
+            println!("{:?}: Adding {:?}, {:?}", i, entry.key, entry.ino);
         }
         reply.ok();
     }
@@ -287,15 +232,15 @@ impl Filesystem for Files {
     ) {
         println!("Write: {:?}, {:?}, {:?} bytes", ino, offset, data.len());
         let offset = offset as usize;
-        let file = match self.inode_tree.get_inode_from_ino(ino) {
-            Ok(entry) => entry,
+        let path = match self.inode_tree.get_full_path(ino) {
+            Ok(path) => path,
             Err(e) => {
                 println!("write ERROR: {}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        let (mut blocks, code) = match self.bucket.get_object_blocking(&file.key) {
+        let mut blocks = match self.data_source.get_data(&path) {
             Ok(result) => result,
             Err(e) => {
                 println!("write ERROR:{}", e);
@@ -303,25 +248,12 @@ impl Filesystem for Files {
                 return;
             }
         };
-        assert_eq!(code, 200);
         let buffer = data.len() + offset;
         if buffer > 0 {
             blocks.resize(buffer, 0);
         }
         blocks.splice(offset..(data.len() + offset), data.to_vec());
-        let (_, code) =
-            match self
-                .bucket
-                .put_object_blocking(&file.key, blocks.as_slice(), "text/plain")
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    println!("write ERROR:{}", e);
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
-        assert_eq!(code, 200);
+        self.data_source.put_data(&path, blocks);
         reply.written(data.len() as u32);
     }
 
@@ -337,34 +269,24 @@ impl Filesystem for Files {
         println!("Create: {:?},{:?}", name, parent);
         let name = name.to_str().unwrap();
 
-        let parent_name = match self.inode_tree.get_inode_from_ino(parent) {
-            Ok(entry) => entry.key.clone(),
+        let parent_node = match self.inode_tree.get_inode_from_ino(parent) {
+            Ok(entry) => entry,
             Err(e) => {
                 println!("create ERROR:{}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        let parent_name = if parent_name != "".to_string() {
-            format!("{}/", parent_name)
-        } else {
-            parent_name
-        };
-        let key = format!("{}{}", parent_name, name);
-        let (_, code) = match self.bucket.put_object_blocking(&key, &[], "text/plain") {
-            Ok(result) => result,
-            Err(e) => {
-                println!("create ERROR:{}", e);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        assert_eq!(code, 200);
 
-        let file_ino =
-            self.add_inode_table_entry(key, parent, 0, UNIX_EPOCH, FileType::RegularFile);
+        let file_ino = self.inode_tree.add_empty(
+            name.to_string(),
+            parent,
+        );
+        let full_path = self.inode_tree.get_full_path(file_ino).unwrap();
+        self.data_source.put_data(&full_path, vec![]);
+
         let attr = match self.inode_tree.get_inode_from_ino(file_ino) {
-            Ok(entry) => entry.getFileAttr(),
+            Ok(entry) => entry.get_file_attr(),
             Err(e) => {
                 println!("create ERROR:{}", e);
                 reply.error(ENOENT);
@@ -377,50 +299,49 @@ impl Filesystem for Files {
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         println!("Unlink {:?}, {:?}", name, parent);
-        let key = match self
+        let entry = match self
             .inode_tree
-            .get_inode_from_name_parent(name.to_str().unwrap(), parent)
+            .get_inode_from_key_parent(name.to_str().unwrap(), parent)
         {
-            Ok(entry) => &entry.key,
+            Ok(entry) => entry,
             Err(e) => {
                 println!("unlink ERROR:{}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        let (res, code) = match self.bucket.delete_object_blocking(key) {
-            Ok(result) => result,
+        let full_path = match self.inode_tree.get_full_path(entry.ino) {
+            Ok(path) => path,
             Err(e) => {
                 println!("unlink ERROR:{}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        assert_eq!(204, code);
+        let code = self.data_source.delete_data(&full_path);
         reply.ok();
     }
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
         let name = name.to_str().unwrap();
         println!("mkdir {}, {}", parent, name);
-        let parent_name = match self.inode_tree.get_inode_from_ino(parent) {
-            Ok(entry) => entry.key.clone(),
+       /* let parent_node = match self.inode_tree.get_inode_from_ino(parent) {
+            Ok(entry) => entry,
             Err(e) => {
                 println!("mkdir ERROR: {}", e);
                 reply.error(ENOENT);
                 return;
             }
         };
-        let parent_name = if parent_name != "" {
-            format!("{}/", parent_name)
-        } else {
-            parent_name
-        };
-        let dir = parent_name + name;
-        let empty_placeholder = format!("{}/.bzEmpty", &dir);
+
+        let dir_ino = self.inode_tree.add_inode_dir(
+            name,
+            Some(parent)
+        );
+        let path = self.inode_tree.get_full_path(dir_ino).unwrap();
         let (res, code) =
             match self
                 .bucket
-                .put_object_blocking(&empty_placeholder, &[], "text/plain")
+                .put_object_blocking(path + "/.bzEmpty", &[], "text/plain")
             {
                 Ok(result) => result,
                 Err(e) => {
@@ -429,26 +350,18 @@ impl Filesystem for Files {
                     return;
                 }
             };
-        let dir_ino = self.add_inode_table_entry_dir(&dir);
-        /*self.add_inode_table_entry(
-            empty_placeholder,
-            dir_ino,
-            0,
-            UNIX_EPOCH,
-            FileType::RegularFile,
-        );*/
         let attr = self
             .inode_tree
             .get_inode_from_ino(dir_ino)
             .unwrap()
-            .getFileAttr();
-        reply.entry(&Duration::from_secs(1), &attr, 0)
+            .get_file_attr();
+        reply.entry(&Duration::from_secs(1), &attr, 0)*/
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_str().unwrap();
         println!("rmdir {}, {}", parent, name);
-        let dir = match self.inode_tree.get_inode_from_name_parent(name, parent) {
+        /*let dir = match self.inode_tree.get_inode_from_key_parent(name, parent) {
             Ok(entry) => entry,
             Err(e) => {
                 println!("rmdir ERROR: {}", e);
@@ -457,13 +370,11 @@ impl Filesystem for Files {
             }
         };
         let children_count = self.inode_tree.get_children(dir.ino).iter().count();
+        let full_path = self.inode_tree.get_full_path(dir.ino).unwrap();
         if children_count > 0 {
             reply.error(ENOTEMPTY);
         } else {
-            let (result, code) = match self
-                .bucket
-                .delete_object_blocking(format!("{}/.bzEmpty", &dir.key))
-            {
+            let (result, code) = match self.bucket.delete_object_blocking(full_path + "/.bzEmpty") {
                 Ok(result) => result,
                 Err(e) => {
                     println!("rmdir ERROR: {}", e);
@@ -473,6 +384,6 @@ impl Filesystem for Files {
             };
             assert_eq!(204, code);
             reply.ok();
-        }
+        }*/
     }
 }

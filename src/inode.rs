@@ -1,13 +1,15 @@
 use fuse::{FileAttr, FileType};
 use std::time::SystemTime;
 
+#[derive(Clone)]
 pub struct INode {
     pub key: String,
     pub ino: u64,
-    size: u64,
-    mtime: SystemTime,
+    pub size: u64,
+    pub mtime: SystemTime,
     pub kind: FileType,
     pub parent: u64,
+    data_hash:Vec<u8>,
 }
 
 impl INode {
@@ -26,10 +28,11 @@ impl INode {
             mtime,
             kind,
             parent,
+            data_hash:vec![],
         }
     }
 
-    pub fn getFileAttr(&self) -> FileAttr {
+    pub fn get_file_attr(&self) -> FileAttr {
         FileAttr {
             ino: self.ino,
             size: self.size,
