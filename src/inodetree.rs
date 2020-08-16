@@ -237,4 +237,12 @@ impl INodeTree {
         }
         hashes
     }
+
+    pub fn get_root_parent(&self, ino:u64) -> Result<&INode,INodeTreeError>{
+        let node = self.get_inode_from_ino(ino)?;
+        match node.parent{
+            1 => Ok(node),
+            _ => Ok(self.get_root_parent(node.parent)?)
+        }
+    }
 }

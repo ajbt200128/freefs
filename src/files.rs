@@ -8,7 +8,7 @@ use fuse::{
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use futures::executor::block_on;
-use libc::{ENOENT, ENOTEMPTY};
+use libc::{EINVAL, ENOENT, ENOTEMPTY, EROFS};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::{
@@ -16,6 +16,7 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
 
 pub struct Files {
     data_source: Arc<BucketSource>,
@@ -48,6 +49,12 @@ impl Files {
                 node.mtime = mtime;
             }
         }
+        let user = new
+            .data_source
+            .get_manager_user()
+            .expect("Could not find a key manager user");
+        println!("User: {:?}", user);
+        new.inode_tree.add_inode_dir(&user, Some(1));
         new
     }
 
@@ -73,6 +80,22 @@ impl Files {
             };
         });
         self.write_inode_tree();
+    }
+
+    fn folder_name_recipient(&self, name: &str) -> Option<Vec<String>> {
+        if !name.contains(
+            &self.data_source
+                .get_manager_user()
+                .expect("Could not find a key manager user"),
+        ) {
+            return None
+        }
+
+        let recipients: Vec<String> = keys_grpc_rs::get_users_from_string(name);
+        match recipients.len() {
+            0 => None,
+            _ => Some(recipients),
+        }
     }
 }
 
@@ -240,7 +263,7 @@ impl Filesystem for Files {
         reply: ReplyWrite,
     ) {
         println!("Write: {:?}, {:?}, {:?} bytes", ino, offset, data.len());
-        let mut hash = blake3::hash(b"");
+        let hash;
         {
             let offset = offset as usize;
             let inode = match self.inode_tree.get_inode_from_ino(ino) {
@@ -264,7 +287,9 @@ impl Filesystem for Files {
                 blocks.resize(buffer, 0);
             }
             blocks.splice(offset..(data.len() + offset), data.to_vec());
-            hash = self.data_source.put_data(blocks);
+            let recipients = self.inode_tree.get_root_parent(ino).unwrap();
+            let recipients = self.folder_name_recipient(&recipients.key);
+            hash = self.data_source.put_data(blocks, recipients);
             match self.inode_tree.update_inode_hash(ino, hash.clone()) {
                 Err(e) => println!("write ERROR:{}", e),
                 _ => {}
@@ -290,20 +315,17 @@ impl Filesystem for Files {
     ) {
         println!("Create: {:?},{:?}", name, parent);
         let name = name.to_str().unwrap();
-
-        let parent_node = match self.inode_tree.get_inode_from_ino(parent) {
-            Ok(entry) => entry,
-            Err(e) => {
-                println!("create ERROR:{}", e);
-                reply.error(ENOENT);
-                return;
-            }
-        };
+        if parent == 1 {
+            reply.error(EROFS);
+            return;
+        }
 
         let ino = self
             .inode_tree
             .add_empty(name.to_string(), blake3::hash(b""), parent);
-        let hash = self.data_source.put_data(vec![]);
+        let recipients = self.inode_tree.get_root_parent(ino).unwrap();
+        let recipients = self.folder_name_recipient(&recipients.key);
+        let hash = self.data_source.put_data(vec![], recipients);
         match self.inode_tree.update_inode_hash(ino, hash) {
             Err(e) => println!("create ERROR:{}", e),
             _ => {}
@@ -323,7 +345,7 @@ impl Filesystem for Files {
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         println!("Unlink {:?}, {:?}", name, parent);
-        let mut ino: Option<u64> = None;
+        let ino: Option<u64>;
         {
             let entry = match self
                 .inode_tree
@@ -348,12 +370,21 @@ impl Filesystem for Files {
             Some(ino) => self.inode_tree.remove(ino),
             None => {}
         }
+        println!("{}", self.inode_tree.write_all_to_string());
+        self.sync_path();
 
         reply.ok();
     }
+
     fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, reply: ReplyEntry) {
         let name = name.to_str().unwrap();
         println!("mkdir {}, {}", parent, name);
+        if parent == 1 {
+            if let None = self.folder_name_recipient(name) {
+                reply.error(EINVAL);
+                return;
+            }
+        }
         let dir_ino = self.inode_tree.add_inode_dir(name, Some(parent));
         let attr = self
             .inode_tree

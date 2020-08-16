@@ -4,8 +4,9 @@ use s3::region::Region;
 use std::path::Path;
 
 use freefs::{
-    datasource::sources::s3_bucket::BucketSource, files::Files, keys_manager::KeysManager, Storage,
+    datasource::sources::s3_bucket::BucketSource, files::Files, Storage,
 };
+use keys_grpc_rs::KeysManager;
 
 fn main() {
     let bb = Storage {
@@ -17,7 +18,7 @@ fn main() {
         credentials: Credentials::default_blocking().unwrap(),
         bucket: "rust-test".to_string(),
     };
-    let mut manager = KeysManager::new();
+    let mut manager = KeysManager::new("freefs".to_string());
     //manager.auth_setup();
     manager.auth_unlock();
     let bucket = create_bucket(bb);

@@ -5,12 +5,7 @@ pub mod files;
 pub mod inode;
 pub mod inodetree;
 pub mod datasource;
-pub mod keys_manager;
-pub mod proto;
 
-//pub mod keys{
-//    tonic::include_proto!("service");
-//}
 pub struct Storage {
     pub name: String,
     pub region: Region,

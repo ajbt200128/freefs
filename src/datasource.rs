@@ -1,6 +1,6 @@
-use crate::keys_manager::KeysManager;
+use keys_grpc_rs::KeysManager;
 use async_trait::async_trait;
-use blake3;
+use blake3::Hash;
 use fuse::FileType;
 use futures::future::join_all;
 use std::{
@@ -16,14 +16,6 @@ use walkdir::WalkDir;
 #[derive(Debug)]
 pub struct DataSourceError {
     msg: String,
-}
-
-impl From<io::Error> for DataSourceError {
-    fn from(error: io::Error) -> Self {
-        DataSourceError {
-            msg: error.to_string(),
-        }
-    }
 }
 
 impl DataSourceError {
@@ -42,11 +34,19 @@ impl fmt::Display for DataSourceError {
     }
 }
 
-pub fn hash_from_string(string: String) -> blake3::Hash {
+impl From<io::Error> for DataSourceError {
+    fn from(error: io::Error) -> Self {
+        DataSourceError {
+            msg: error.to_string(),
+        }
+    }
+}
+
+pub fn hash_from_string(string: String) -> Hash {
     let mut arr: [u8; 32] = [0; 32];
     let bytes = &hex::decode(string).unwrap()[0..32];
     arr.copy_from_slice(bytes);
-    blake3::Hash::from(arr)
+    Hash::from(arr)
 }
 
 #[derive(Debug)]
@@ -59,19 +59,23 @@ pub enum Area {
 pub trait DataSource {
     fn get_area_path(&self, area: &Area) -> &String;
     fn get_keys_manager(&self) -> &KeysManager;
-    fn get_data_from_source(&self, hash: &blake3::Hash) -> Result<Vec<u8>, DataSourceError>;
+    fn get_data_from_source(&self, hash: &Hash) -> Result<Vec<u8>, DataSourceError>;
     async fn put_data_from_source(
         &self,
-        hash: blake3::Hash,
+        hash: Hash,
         data: Vec<u8>,
     ) -> Result<(), DataSourceError>;
-    async fn delete_data_from_source(&self, hash: &blake3::Hash) -> Result<(), DataSourceError>;
+    async fn delete_data_from_source(&self, hash: &Hash) -> Result<(), DataSourceError>;
     fn get_data_attr_from_source(
         &self,
-        hash: &blake3::Hash,
+        hash: &Hash,
     ) -> Result<(u64, SystemTime), DataSourceError>;
     fn put_log_source(&self, log: Vec<u8>) -> Result<(), DataSourceError>;
     fn get_log_source(&self) -> Result<Vec<u8>, DataSourceError>;
+
+    fn get_manager_user(&self) -> Option<String> {
+        Some(self.get_keys_manager().get_user()?)
+    }
 
     fn put_log(&self, log: String) {
         let log = self
@@ -87,7 +91,7 @@ pub trait DataSource {
         };
     }
 
-    fn get_log(&self) -> Vec<(blake3::Hash, String, FileType)> {
+    fn get_log(&self) -> Vec<(Hash, String, FileType)> {
         let absolute_path = format!("{}/.log", self.get_area_path(&Area::Stage));
         let entries_enc;
         if Path::new(&absolute_path).exists() {
@@ -98,12 +102,10 @@ pub trait DataSource {
                 _ => return vec![],
             };
         }
-        let entries_enc = self
-            .get_keys_manager()
-            .decrypt(entries_enc, false);
+        let entries_enc = self.get_keys_manager().decrypt(entries_enc, false);
         let entries_string = std::str::from_utf8(&entries_enc).unwrap();
         let entries: Vec<&str> = entries_string.split("\n").collect();
-        let mut nodes: Vec<(blake3::Hash, String, FileType)> = vec![];
+        let mut nodes: Vec<(Hash, String, FileType)> = vec![];
         for entry in entries {
             let entry: Vec<&str> = entry.split("\t").collect();
             if entry.len() == 3 {
@@ -122,14 +124,14 @@ pub trait DataSource {
         nodes
     }
 
-    fn check_in_area(&self, hash: &blake3::Hash, area: &Area) -> bool {
+    fn check_in_area(&self, hash: &Hash, area: &Area) -> bool {
         let absolute_path = format!("{}/{}", self.get_area_path(area), hash.to_hex());
         Path::new(&absolute_path).exists()
     }
 
     fn get_data_from_area(
         &self,
-        hash: &blake3::Hash,
+        hash: &Hash,
         area: &Area,
     ) -> Result<Vec<u8>, DataSourceError> {
         let absolute_path = format!("{}/{}", self.get_area_path(area), hash.to_hex());
@@ -137,7 +139,7 @@ pub trait DataSource {
         Ok(buf)
     }
 
-    fn put_data_area(&self, hash: &blake3::Hash, data: &[u8], area: &Area) {
+    fn put_data_area(&self, hash: &Hash, data: &[u8], area: &Area) {
         let absolute_path = format!("{}/{}", self.get_area_path(area), hash.to_hex());
         println!("Create in area: {}", absolute_path);
         let mut file = File::create(&absolute_path).unwrap();
@@ -149,13 +151,13 @@ pub trait DataSource {
         };
     }
 
-    fn put_hash_data_area(&self, data: &Vec<u8>, area: &Area) -> blake3::Hash {
+    fn put_hash_data_area(&self, data: &Vec<u8>, area: &Area) -> Hash {
         let hash = blake3::hash(&data);
         self.put_data_area(&hash, &data, area);
         hash
     }
 
-    fn delete_data_area(&self, hash: &blake3::Hash, area: &Area) -> Result<(), DataSourceError> {
+    fn delete_data_area(&self, hash: &Hash, area: &Area) -> Result<(), DataSourceError> {
         let absolute_path = format!("{}/{}", self.get_area_path(area), hash.to_hex());
         if Path::new(&absolute_path).exists() {
             fs::remove_file(&absolute_path)?;
@@ -163,7 +165,7 @@ pub trait DataSource {
         Ok(())
     }
 
-    fn get_hashes_area(&self, area: &Area) -> Result<Vec<blake3::Hash>, DataSourceError> {
+    fn get_hashes_area(&self, area: &Area) -> Result<Vec<Hash>, DataSourceError> {
         let absolute_path = format!("{}/", self.get_area_path(area));
         let dir = WalkDir::new(&absolute_path);
         let mut hashes = vec![];
@@ -185,7 +187,7 @@ pub trait DataSource {
     }
     fn get_data_attr_area(
         &self,
-        hash: &blake3::Hash,
+        hash: &Hash,
         area: &Area,
     ) -> Result<(u64, SystemTime), DataSourceError> {
         let absolute_path = format!("{}/{}", self.get_area_path(area), hash.to_hex());
@@ -193,7 +195,7 @@ pub trait DataSource {
         Ok((file.len(), file.modified()?))
     }
 
-    fn get_data(&self, hash: &blake3::Hash) -> Result<Vec<u8>, DataSourceError> {
+    fn get_data(&self, hash: &Hash) -> Result<Vec<u8>, DataSourceError> {
         println!("Get data: {}", hash.to_hex());
         let data;
         if self.check_in_area(&hash, &Area::Stage) {
@@ -208,19 +210,19 @@ pub trait DataSource {
         let data = self.get_keys_manager().decrypt(data, false);
         Ok(data)
     }
-    fn put_data(&self, data: Vec<u8>) -> blake3::Hash {
-        let data = self.get_keys_manager().encrypt(data, None, false);
+    fn put_data(&self, data: Vec<u8>, recipients:Option<Vec<String>>) -> Hash {
+        let data = self.get_keys_manager().encrypt(data, recipients, false);
         self.put_hash_data_area(&data, &Area::Stage)
     }
 
-    async fn delete_data(&self, hash: &blake3::Hash) -> Result<(), DataSourceError> {
+    async fn delete_data(&self, hash: &Hash) -> Result<(), DataSourceError> {
         self.delete_data_area(hash, &Area::Transient)?;
         self.delete_data_area(hash, &Area::Stage)?;
         self.delete_data_from_source(hash).await?;
         Ok(())
     }
 
-    fn get_data_attr(&self, hash: &blake3::Hash) -> Result<(u64, SystemTime), DataSourceError> {
+    fn get_data_attr(&self, hash: &Hash) -> Result<(u64, SystemTime), DataSourceError> {
         if self.check_in_area(&hash, &Area::Stage) {
             Ok(self.get_data_attr_area(hash, &Area::Stage)?)
         } else {
@@ -230,7 +232,7 @@ pub trait DataSource {
 
     async fn sync_stage_area(
         &self,
-        valid_hashes: Vec<blake3::Hash>,
+        valid_hashes: Vec<Hash>,
     ) -> Result<(), DataSourceError> {
         let mut futs = vec![];
         let hashes = self.get_hashes_area(&Area::Stage)?;
@@ -263,13 +265,12 @@ pub trait DataSource {
 
 pub mod sources {
     pub mod s3_bucket {
-        use crate::{
-            datasource::{Area, DataSource, DataSourceError},
-            keys_manager::KeysManager,
-        };
+        use crate::datasource::{Area, DataSource, DataSourceError};
         use async_trait::async_trait;
         use s3::{bucket::Bucket, S3Error};
         use std::time::{Duration, UNIX_EPOCH};
+        use keys_grpc_rs::KeysManager;
+        use blake3::Hash;
 
         impl From<S3Error> for DataSourceError {
             fn from(err: S3Error) -> Self {
@@ -312,7 +313,7 @@ pub mod sources {
             }
             fn get_data_from_source(
                 &self,
-                hash: &blake3::Hash,
+                hash: &Hash,
             ) -> Result<Vec<u8>, DataSourceError> {
                 let (result, code) = self.bucket.get_object_blocking(hash.to_hex())?;
                 if code != 200 {
@@ -323,7 +324,7 @@ pub mod sources {
             }
             async fn put_data_from_source(
                 &self,
-                hash: blake3::Hash,
+                hash: Hash,
                 data: Vec<u8>,
             ) -> Result<(), DataSourceError> {
                 let (_, code) =
@@ -338,7 +339,7 @@ pub mod sources {
 
             async fn delete_data_from_source(
                 &self,
-                hash: &blake3::Hash,
+                hash: &Hash,
             ) -> Result<(), DataSourceError> {
                 let (_, code) = self.bucket.delete_object_blocking(hash.to_hex())?;
                 if code != 204 {
@@ -350,7 +351,7 @@ pub mod sources {
 
             fn get_data_attr_from_source(
                 &self,
-                hash: &blake3::Hash,
+                hash: &Hash,
             ) -> Result<(u64, std::time::SystemTime), DataSourceError> {
                 let results = self
                     .bucket
@@ -359,7 +360,10 @@ pub mod sources {
                 if code != &200 {
                     return Err(DataSourceError::new(&format!("Error wrong code: {}", code)));
                 }
-                let obj = result.contents.first().unwrap();
+                let obj = match result.contents.first() {
+                    Some(obj) => obj,
+                    None => return Err(DataSourceError::new("S3 list blocking empty")),
+                };
                 let time = chrono::DateTime::parse_from_rfc3339(&obj.last_modified).unwrap();
                 let time = UNIX_EPOCH + Duration::from_millis(time.timestamp_millis() as u64);
                 let size = obj.size;
@@ -367,9 +371,9 @@ pub mod sources {
             }
 
             fn put_log_source(&self, log: Vec<u8>) -> Result<(), DataSourceError> {
-                let (_, code) =
-                    self.bucket
-                        .put_object_blocking(".log", &log, "text/plain")?;
+                let (_, code) = self
+                    .bucket
+                    .put_object_blocking(".log", &log, "text/plain")?;
                 if code != 200 {
                     Err(DataSourceError::new(&format!("Error wrong code: {}", code)))
                 } else {
@@ -384,7 +388,7 @@ pub mod sources {
                     Ok(result)
                 }
             }
-            fn get_keys_manager(&self) -> &crate::keys_manager::KeysManager {
+            fn get_keys_manager(&self) -> &KeysManager {
                 &self.keys_manager
             }
         }
